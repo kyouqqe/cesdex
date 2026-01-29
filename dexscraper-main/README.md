@@ -248,7 +248,7 @@ scraper = DexScraper(
 ## 📣 Signal Bot (Pump/Dump)
 
 ### Configuration
-Copy `config.signal_bot.yaml` and adjust the stream + detector settings:
+Copy `config.yaml` (or `config.signal_bot.yaml`) and adjust the stream + detector settings:
 
 ```yaml
 stream:
@@ -263,7 +263,7 @@ stream:
 ```
 
 ### Environment Variables
-The Telegram notifier requires:
+Create `.env` from `.env.example` and set:
 
 ```bash
 export TELEGRAM_BOT_TOKEN="123456:bot-token"
@@ -272,12 +272,18 @@ export TELEGRAM_CHAT_ID="123456789"
 
 ### Run
 ```bash
-python -m dexscraper.signal_bot --config config.signal_bot.yaml
+python -m dexscraper.signal_bot --config config.yaml
 ```
 
-> REST enrichment is used as the source of truth for price, liquidity, FDV/market cap,
-> and pair age. Events without a valid `createdAt` are dropped to avoid sending
-> placeholder data.
+> REST enrichment is the source of truth for price, liquidity, FDV/market cap,
+> priceChange, and pair age. WebSocket data is used only for discovery. Events
+> without a valid `createdAt` are dropped to avoid placeholder data.
+
+### Tests
+```bash
+pip install -e .[dev]
+pytest
+```
 
 ## 🛡️ Security & Reliability
 

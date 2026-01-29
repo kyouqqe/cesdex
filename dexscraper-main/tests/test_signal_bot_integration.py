@@ -1,8 +1,9 @@
 import time
 
 import pytest
+from aioresponses import aioresponses
 
-from dexscraper.enrich.dexscreener_rest import DexScreenerPairData
+from dexscraper.enrich.dexscreener_rest import DexScreenerRestClient
 from dexscraper.models import ExtractedTokenBatch, TokenProfile
 from dexscraper.signal_bot import (
     DetectorConfig,
@@ -10,23 +11,6 @@ from dexscraper.signal_bot import (
     TimeSeriesStore,
     process_batch,
 )
-
-
-class FakeRestClient:
-    async def get_pair_data(self, token_address: str, pair_address: str):
-        return DexScreenerPairData(
-            price_usd=1.0,
-            liquidity_usd=25000,
-            fdv=None,
-            market_cap=150000,
-            change_m5=None,
-            change_h1=None,
-            change_h24=None,
-            created_at=int(time.time()) - 7200,
-            pair_address=pair_address,
-            chain="solana",
-            dex_id="pumpfun",
-        )
 
 
 class FakeNotifier:
@@ -54,7 +38,23 @@ async def test_integration_enrich_normalize_detect_telegram() -> None:
         )
     )
     notifier = FakeNotifier()
-    rest_client = FakeRestClient()
+    rest_client = DexScreenerRestClient()
+    url = "https://api.dexscreener.com/latest/dex/tokens/contract"
+    payload = {
+        "pairs": [
+            {
+                "pairAddress": "pair",
+                "priceUsd": "1.0",
+                "liquidity": {"usd": "25000"},
+                "marketCap": "150000",
+                "priceChange": {"m5": "5.0", "h1": "5.0", "h24": "1.0"},
+                "pairCreatedAt": int((time.time() - 7200) * 1000),
+                "chainId": "solana",
+                "dexId": "pumpfun",
+                "baseToken": {"symbol": "AAA"},
+            }
+        ]
+    }
     now = time.time()
     tokens = [
         TokenProfile(
@@ -92,13 +92,16 @@ async def test_integration_enrich_normalize_detect_telegram() -> None:
         ),
     ]
     batch = ExtractedTokenBatch(tokens=tokens)
-    signals = await process_batch(
-        batch,
-        store,
-        detector,
-        notifier,
-        min_points_window=3,
-        rest_client=rest_client,
-    )
-    assert signals
-    assert notifier.messages
+    async with rest_client:
+        with aioresponses() as mocked:
+            mocked.get(url, payload=payload)
+            signals = await process_batch(
+                batch,
+                store,
+                detector,
+                notifier,
+                min_points_window=3,
+                rest_client=rest_client,
+            )
+            assert signals
+            assert notifier.messages

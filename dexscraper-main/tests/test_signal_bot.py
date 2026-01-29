@@ -1,8 +1,9 @@
 import time
 
 import pytest
+from aioresponses import aioresponses
 
-from dexscraper.enrich.dexscreener_rest import DexScreenerPairData
+from dexscraper.enrich.dexscreener_rest import DexScreenerRestClient
 from dexscraper.models import ExtractedTokenBatch, TokenProfile
 from dexscraper.signal_bot import (
     DetectorConfig,
@@ -11,7 +12,7 @@ from dexscraper.signal_bot import (
     Signal,
     TimeSeriesStore,
     format_signal_message,
-    normalize_with_reason,
+    normalize,
     process_batch,
 )
 
@@ -85,15 +86,30 @@ async def test_normalize_sanity_checks() -> None:
         protocol="pumpfun",
         pair_address="pair",
         token_address="contract",
-        price=1e-12,
-        liquidity=20000,
-        market_cap=100000,
         age="1h",
         timestamp=int(time.time()),
     )
-    event, reason = await normalize_with_reason(token, rest_client=None)
-    assert event is None
-    assert reason == "price_liquidity_mismatch"
+    url = "https://api.dexscreener.com/latest/dex/tokens/contract"
+    payload = {
+        "pairs": [
+            {
+                "pairAddress": "pair",
+                "priceUsd": "0.5",
+                "liquidity": {"usd": "20000"},
+                "marketCap": "100000",
+                "priceChange": {"m5": "1.0", "h1": "2.0", "h24": "3.0"},
+                "pairCreatedAt": int(time.time() * 1000),
+                "chainId": "solana",
+                "dexId": "pumpfun",
+                "baseToken": {"symbol": "AAA"},
+            }
+        ]
+    }
+    async with DexScreenerRestClient() as rest_client:
+        with aioresponses() as mocked:
+            mocked.get(url, payload=payload)
+            event = await normalize(token, rest_client=rest_client)
+    assert event is not None
 
 
 @pytest.mark.asyncio
@@ -104,22 +120,6 @@ async def test_process_batch_triggers_send() -> None:
 
         async def send(self, message: str) -> None:
             self.messages.append(message)
-
-    class DummyRestClient:
-        async def get_pair_data(self, token_address: str, pair_address: str):
-            return DexScreenerPairData(
-                price_usd=1.0,
-                liquidity_usd=20000,
-                fdv=None,
-                market_cap=100000,
-                change_m5=None,
-                change_h1=None,
-                change_h24=None,
-                created_at=int(time.time()) - 3600,
-                pair_address=pair_address,
-                chain="solana",
-                dex_id="pumpfun",
-            )
 
     store = TimeSeriesStore()
     detector = PumpDumpDetector(
@@ -136,6 +136,22 @@ async def test_process_batch_triggers_send() -> None:
         )
     )
     notifier = DummyNotifier()
+    url = "https://api.dexscreener.com/latest/dex/tokens/contract"
+    payload = {
+        "pairs": [
+            {
+                "pairAddress": "pair",
+                "priceUsd": "1.2",
+                "liquidity": {"usd": "20000"},
+                "marketCap": "100000",
+                "priceChange": {"m5": "10.0", "h1": "10.0", "h24": "1.0"},
+                "pairCreatedAt": int((time.time() - 3600) * 1000),
+                "chainId": "solana",
+                "dexId": "pumpfun",
+                "baseToken": {"symbol": "AAA"},
+            }
+        ]
+    }
     base_time = time.time()
     tokens = [
         TokenProfile(
@@ -173,5 +189,10 @@ async def test_process_batch_triggers_send() -> None:
         ),
     ]
     batch = ExtractedTokenBatch(tokens=tokens)
-    await process_batch(batch, store, detector, notifier, 3, rest_client=DummyRestClient())
+    async with DexScreenerRestClient() as rest_client:
+        with aioresponses() as mocked:
+            mocked.get(url, payload=payload)
+            await process_batch(
+                batch, store, detector, notifier, 3, rest_client=rest_client
+            )
     assert notifier.messages

@@ -4,7 +4,7 @@ import logging
 import struct
 from typing import Dict, List, Optional
 
-from .models import PriceData, TradingPair
+from .models import TradingPair
 
 logger = logging.getLogger(__name__)
 
@@ -217,19 +217,6 @@ class EnhancedProtocolParser:
                     if not token_name:
                         token_name = word
 
-            # Build price data from cluster (no derived change metrics)
-            price_data = None
-            if cluster_data["prices"]:
-                price = cluster_data["prices"][0][1]  # Take first price
-                price_data = PriceData(current=price, usd=price, change_24h=None)
-
-            # Do not fabricate volume/liquidity values from heuristics
-            volume_data = None
-            liquidity_data = None
-
-            # Avoid fabricated timestamps; use None unless known
-            created_at = None
-
             return TradingPair(
                 chain=chain,
                 protocol=protocol,
@@ -237,10 +224,10 @@ class EnhancedProtocolParser:
                 base_token_name=token_name or "Unknown Token",
                 base_token_symbol=token_symbol or "",
                 base_token_address="",  # nosec B106
-                price_data=price_data,
-                volume_data=volume_data,
-                liquidity_data=liquidity_data,
-                created_at=created_at,
+                price_data=None,
+                volume_data=None,
+                liquidity_data=None,
+                created_at=None,
             )
 
         except Exception as e:

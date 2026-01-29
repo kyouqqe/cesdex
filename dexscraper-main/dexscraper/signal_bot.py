@@ -16,7 +16,7 @@ import websockets
 import yaml
 
 from .config import Chain, DEX, Filters, Order, RankBy, ScrapingConfig, Timeframe
-from .enrich.dexscreener_rest import DexScreenerPairData, DexScreenerRestClient
+from .enrich.dexscreener_rest import DexScreenerFetchResult, DexScreenerRestClient
 from .models import ExtractedTokenBatch, TokenProfile
 from .scraper import DexScraper
 
@@ -341,8 +341,10 @@ def _build_tools_links(chain: str, pair: str, contract: str) -> Dict[str, str]:
     return links
 
 
-async def normalize(raw_pair: TokenProfile) -> Optional[NormalizedEvent]:
-    event, _ = await normalize_with_reason(raw_pair)
+async def normalize(
+    raw_pair: TokenProfile, rest_client: DexScreenerRestClient
+) -> Optional[NormalizedEvent]:
+    event, _ = await normalize_with_reason(raw_pair, rest_client=rest_client)
     return event
 
 
@@ -357,74 +359,61 @@ async def normalize_with_reason(
     if not raw_pair.pair_address or not raw_pair.token_address:
         return None, "missing_addresses"
 
-    rest_data: Optional[DexScreenerPairData] = None
-    if rest_client is not None:
-        rest_data = await rest_client.get_pair_data(
-            raw_pair.token_address, raw_pair.pair_address
-        )
+    if rest_client is None:
+        return None, "missing_rest_client"
 
-    chain = raw_pair.chain or (rest_data.chain if rest_data else None)
-    protocol = raw_pair.protocol or (rest_data.dex_id if rest_data else None)
-    if not raw_pair.symbol or not chain or not protocol:
+    fetch_result: DexScreenerFetchResult = await rest_client.get_pair_data(
+        raw_pair.token_address, raw_pair.pair_address
+    )
+    if fetch_result.data is None:
+        return None, fetch_result.reason or "rest_unavailable"
+    rest_data = fetch_result.data
+
+    chain = raw_pair.chain or rest_data.chain
+    protocol = raw_pair.protocol or rest_data.dex_id
+    symbol = raw_pair.symbol or rest_data.symbol
+    if not symbol or not chain or not protocol:
         return None, "missing_identity"
 
-    price = (
-        rest_data.price_usd
-        if rest_data and rest_data.price_usd is not None
-        else raw_pair.price
-    )
-    liquidity = (
-        rest_data.liquidity_usd
-        if rest_data and rest_data.liquidity_usd is not None
-        else raw_pair.liquidity
-    )
-    market_cap = None
-    if rest_data:
-        market_cap = rest_data.market_cap or rest_data.fdv
-    if market_cap is None:
-        market_cap = raw_pair.market_cap
+    price = rest_data.price_usd
+    liquidity = rest_data.liquidity_usd
+    market_cap = rest_data.market_cap or rest_data.fdv
 
     if price is None or liquidity is None:
-        return None, "missing_price_or_liquidity"
+        return None, "missing_rest_metrics"
     if market_cap is None:
         return None, "missing_mcap"
 
-    if rest_data:
-        raw_pair.price = price
-        raw_pair.liquidity = liquidity
-        raw_pair.market_cap = market_cap
-        if rest_data.change_m5 is not None:
-            raw_pair.change_5m = rest_data.change_m5
-        if rest_data.change_h1 is not None:
-            raw_pair.change_1h = rest_data.change_h1
-        if rest_data.change_h24 is not None:
-            raw_pair.change_24h = rest_data.change_h24
+    raw_pair.price = price
+    raw_pair.liquidity = liquidity
+    raw_pair.market_cap = market_cap
+    raw_pair.change_5m = rest_data.change_m5
+    raw_pair.change_1h = rest_data.change_h1
+    raw_pair.change_24h = rest_data.change_h24
 
     # Numeric sanity
     if not all(
         math.isfinite(value) for value in (price, liquidity, market_cap)
     ):
-        return None, "non_finite_values"
-    if price <= 0 or liquidity <= 0 or market_cap <= 0:
-        return None, "non_positive_values"
-    # Heuristic: absurdly tiny price with large liquidity is usually a quote/unit mismatch
-    if price < 1e-9 and liquidity >= 10_000:
-        return None, "price_liquidity_mismatch"
+        return None, "invalid_metrics"
+    if price <= 0 or liquidity < 0 or market_cap < 0:
+        return None, "invalid_metrics"
 
-    age_days: Optional[float] = None
-    if rest_data and rest_data.created_at is not None:
-        age_days = parse_age_days_from_created_at(rest_data.created_at)
-    elif rest_client is None:
-        age_days = parse_age_days(raw_pair.age)
+    if rest_data.created_at is None:
+        return None, "missing_created_at"
+    age_days = parse_age_days_from_created_at(rest_data.created_at)
     if age_days is None:
         return None, "missing_created_at"
+
+    if raw_pair.change_5m is None or raw_pair.change_1h is None:
+        return None, "missing_price_change"
 
     tools_links = _build_tools_links(
         chain, raw_pair.pair_address, raw_pair.token_address
     )
 
     event = NormalizedEvent(
-        symbol=raw_pair.symbol.upper(),
+        symbol=symbol.upper(),
         chain=chain,
         dex=protocol,
         pair=raw_pair.pair_address,
@@ -433,8 +422,8 @@ async def normalize_with_reason(
         liquidity_usd=liquidity,
         mcap_or_fdv=market_cap,
         age_days=age_days,
-        change_5m=None,
-        change_1h=None,
+        change_5m=raw_pair.change_5m,
+        change_1h=raw_pair.change_1h,
         tools_links=tools_links,
         ts=float(raw_pair.timestamp or time.time()),
     )
@@ -492,8 +481,6 @@ async def process_batch(
             continue
         key = (event.chain, event.dex, event.pair)
         store.add(key, event.ts, event.price_usd)
-        event.change_5m = store.compute_pct(key, 300, min_points_window, event.ts)
-        event.change_1h = store.compute_pct(key, 3600, min_points_window, event.ts)
         signal = detector.evaluate(event)
         logger.info(
             "[detector] tick chain=%s dex=%s symbol=%s change_5m=%s change_1h=%s triggered=%s",
@@ -625,6 +612,7 @@ async def run_signal_bot(config: SignalBotConfig) -> None:
             rest_client=rest_client,
         )
     finally:
+        await rest_client.close()
         if notifier:
             await notifier.stop()
 

@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import time
-import urllib.request
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
+
+import aiohttp
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +26,13 @@ class DexScreenerPairData:
     pair_address: Optional[str] = None
     chain: Optional[str] = None
     dex_id: Optional[str] = None
+    symbol: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class DexScreenerFetchResult:
+    data: Optional[DexScreenerPairData]
+    reason: str
 
 
 def age_days_from_created_at(
@@ -70,6 +77,7 @@ def parse_dexscreener_response(
     market_cap = _safe_float(selected.get("marketCap"))
     price_change = selected.get("priceChange") or {}
 
+    base_token = selected.get("baseToken") or {}
     return DexScreenerPairData(
         price_usd=price_usd,
         liquidity_usd=liquidity_usd,
@@ -84,6 +92,7 @@ def parse_dexscreener_response(
         pair_address=selected.get("pairAddress"),
         chain=selected.get("chainId"),
         dex_id=selected.get("dexId"),
+        symbol=base_token.get("symbol"),
     )
 
 
@@ -103,37 +112,70 @@ class DexScreenerRestClient:
         self._max_retries = max_retries
         self._timeout_s = timeout_s
         self._base_url = base_url.rstrip("/")
-        self._cache: Dict[Tuple[str, str], Tuple[float, Optional[DexScreenerPairData]]] = (
-            {}
-        )
+        self._cache: Dict[
+            Tuple[str, str], Tuple[float, DexScreenerFetchResult]
+        ] = {}
         self._last_request = 0.0
         self._lock = asyncio.Lock()
+        self._session: Optional[aiohttp.ClientSession] = None
+
+    async def __aenter__(self) -> "DexScreenerRestClient":
+        await self._ensure_session()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        await self.close()
+
+    async def close(self) -> None:
+        if self._session is not None:
+            await self._session.close()
+            self._session = None
 
     async def get_pair_data(
         self, token_address: str, pair_address: Optional[str] = None
-    ) -> Optional[DexScreenerPairData]:
+    ) -> DexScreenerFetchResult:
         cache_key = (token_address.lower(), pair_address or "")
         now = time.time()
         cached = self._cache.get(cache_key)
         if cached and cached[0] >= now:
             return cached[1]
 
-        payload = await self._fetch_json(token_address)
+        payload, fetch_reason = await self._fetch_json(token_address)
         if payload is None:
-            self._cache[cache_key] = (now + self._cache_ttl_s, None)
-            return None
+            result = DexScreenerFetchResult(data=None, reason=fetch_reason)
+            self._cache[cache_key] = (now + self._cache_ttl_s, result)
+            return result
 
         pair_data = parse_dexscreener_response(payload, token_address, pair_address)
-        self._cache[cache_key] = (now + self._cache_ttl_s, pair_data)
-        return pair_data
+        if pair_data is None:
+            result = DexScreenerFetchResult(data=None, reason="rest_no_pairs")
+        elif pair_data.created_at is None:
+            result = DexScreenerFetchResult(data=None, reason="missing_created_at")
+        else:
+            result = DexScreenerFetchResult(data=pair_data, reason="")
+        self._cache[cache_key] = (now + self._cache_ttl_s, result)
+        return result
 
-    async def _fetch_json(self, token_address: str) -> Optional[Dict[str, Any]]:
+    async def _fetch_json(
+        self, token_address: str
+    ) -> Tuple[Optional[Dict[str, Any]], str]:
         url = f"{self._base_url}/{token_address}"
+        await self._ensure_session()
+        last_reason = "rest_error"
         for attempt in range(self._max_retries + 1):
             try:
                 await self._rate_limit()
-                return await asyncio.to_thread(self._get_json_sync, url)
-            except Exception as exc:
+                assert self._session is not None
+                async with self._session.get(url, timeout=self._timeout_s) as response:
+                    response.raise_for_status()
+                    payload = await response.json()
+                if not isinstance(payload, dict):
+                    raise ValueError("Unexpected payload type")
+                return payload, ""
+            except asyncio.TimeoutError:
+                last_reason = "rest_timeout"
+            except (aiohttp.ClientError, ValueError) as exc:
+                last_reason = "rest_error"
                 if attempt >= self._max_retries:
                     logger.warning(
                         "DexScreener REST failed token=%s: %s", token_address, exc
@@ -147,7 +189,7 @@ class DexScreenerRestClient:
                     delay,
                 )
                 await asyncio.sleep(delay)
-        return None
+        return None, last_reason
 
     async def _rate_limit(self) -> None:
         async with self._lock:
@@ -157,17 +199,13 @@ class DexScreenerRestClient:
                 await asyncio.sleep(self._rate_limit_s - elapsed)
             self._last_request = time.time()
 
-    def _get_json_sync(self, url: str) -> Dict[str, Any]:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (compatible; DexScraper/1.0)",
-            "Accept": "application/json",
-        }
-        request = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(request, timeout=self._timeout_s) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-        if not isinstance(payload, dict):
-            raise ValueError("Unexpected payload type")
-        return payload
+    async def _ensure_session(self) -> None:
+        if self._session is None or self._session.closed:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (compatible; DexScraper/1.0)",
+                "Accept": "application/json",
+            }
+            self._session = aiohttp.ClientSession(headers=headers)
 
 
 def _normalize_epoch_seconds(value: Optional[Any]) -> Optional[int]:
